@@ -42,8 +42,8 @@ The four habitats are **Flat sand**, **Rippled sand**, **Sparse live bottom** an
 ## Setup
 
 ```bash
-git clone <repo-url>
-cd <repo-folder>
+git clone https://github.com/tiles-lab/accessible-ocean-tictactoe.git
+cd accessible-ocean-tictactoe
 
 python3.10 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
