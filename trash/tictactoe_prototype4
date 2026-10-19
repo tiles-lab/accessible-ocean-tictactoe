@@ -1,0 +1,509 @@
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import mediapipe as mp
+import pygame
+import time
+import os
+
+# -------------------------------------------------------------------
+# 1. CONFIGURATION & COLOR DEFINITIONS
+# -------------------------------------------------------------------
+COLOR_HSV_RANGES = {
+    # "Rippled sand":       (np.array([5, 125, 167]), np.array([22, 216, 252])),
+    # "Dense live bottom":  (np.array([69, 4, 108]),   np.array([89, 96, 198])),
+    # "Flat sand":          (np.array([10, 90, 204]),  np.array([27, 176, 255])),
+    # "Sparse live bottom": (np.array([81, 18, 182]),  np.array([100, 107, 255]))
+    # "Rippled sand": (np.array([7, 107, 91]), np.array([24, 193, 173])),
+    # "Dense live bottom": (np.array([86, 121, 47]), np.array([103, 210, 130])),
+    # "Flat sand": (np.array([13, 57, 136]), np.array([30, 140, 222])),
+    # "Sparse live bottom": (np.array([89, 91, 153]), np.array([105, 175, 239])),
+    # "Rippled sand": (np.array([6, 20, 118]), np.array([24, 236, 234])),
+    # "Dense live bottom": (np.array([76, 38, 42]), np.array([97, 165, 159])),
+    # "Flat sand": (np.array([13, 74, 186]), np.array([30, 180, 255])),
+    # "Sparse live bottom": (np.array([84, 53, 147]), np.array([102, 158, 255])),
+
+    "Rippled sand": (np.array([5, 4, 35]), np.array([25, 203, 227])),
+    "Dense live bottom": (np.array([77, 18, 34]), np.array([98, 199, 161])),
+    "Flat sand": (np.array([11, 41, 83]), np.array([34, 153, 255])),
+    "Sparse live bottom": (np.array([82, 73, 65]), np.array([104, 189, 255])),
+}
+
+# Display Colors for the Map Screen (BGR format)
+HABITAT_DISPLAY_COLORS = {
+    "Flat sand":          (120, 215, 255),  # Soft Yellow
+    "Rippled sand":       (60, 180, 240),   # Warm Amber
+    "Sparse live bottom": (120, 200, 120),  # Light Sea Green
+    "Dense live bottom":  (40, 130, 40),    # Deep Forest Green
+    "Grey":               (100, 100, 100)   # Unrevealed Grey
+}
+
+GRID_ROWS = 4
+GRID_COLS = 4
+
+# Each value is a FRACTION of the marker-to-marker span (pt1<->pt2), pulling that
+# edge of the playable grid in from the raw marker bounding box.
+#   - Smaller value  -> that edge moves OUT, closer to (or past) the marker -> bigger grid
+#   - Larger value   -> that edge moves IN, further from the marker -> smaller grid
+#   - Can go negative to push the grid boundary beyond the marker itself.
+GRID_OFFSET_LEFT   = 0.01   # inset from marker 45's side (left edge)
+GRID_OFFSET_TOP    = 0.07   # inset from marker 45's side (top edge)
+GRID_OFFSET_RIGHT  = 0.01   # inset from marker 57's side (right edge)
+GRID_OFFSET_BOTTOM = 0.20   # inset from marker 57's side (bottom edge) - pulled in further
+
+# 4x4 Latin square layout: every habitat appears once per row and once per column.
+TARGET_GRID_HABITATS = [
+    ["Flat sand",          "Dense live bottom",   "Rippled sand",        "Sparse live bottom"],
+    ["Rippled sand",       "Sparse live bottom",  "Flat sand",           "Dense live bottom"],
+    ["Dense live bottom",  "Flat sand",            "Sparse live bottom", "Rippled sand"],
+    ["Sparse live bottom", "Rippled sand",         "Dense live bottom",  "Flat sand"]
+]
+
+TARGET_GRID_ONLY_RIPPLED = [
+    ["Rippled sand",          "Rippled sand",   "Rippled sand",        "Rippled sand"],
+    ["Rippled sand",       "Rippled sand",  "Rippled sand",           "Rippled sand"],
+    ["Rippled sand",  "Rippled sand",            "Rippled sand", "Rippled sand"],
+    ["Rippled sand", "Rippled sand",         "Rippled sand",  "Rippled sand"]
+]
+
+TARGET_GRID_ONLY_SAND = [
+    ["Rippled sand",          "Rippled sand",   "Rippled sand",        "Flat sand"],
+    ["Rippled sand",       "Rippled sand",  "Flat sand",           "Rippled sand"],
+    ["Rippled sand",  "Flat sand",            "Rippled sand", "Rippled sand"],
+    ["Flat sand", "Rippled sand",         "Rippled sand",  "Rippled sand"]
+]
+
+TARGET_GRID_ONLY_SAND_AND_DENSE = [
+    ["Rippled sand",          "Flat sand",   "Flat sand",        "Flat sand"],
+    ["Flat sand",       "Flat sand",  "Dense live bottom",           "Rippled sand"],
+    ["Flat sand",  "Dense live bottom",            "Dense live bottom", "Rippled sand"],
+    ["Dense live bottom", "Dense live bottom",         "Dense live bottom",  "Dense live bottom"]
+]
+
+TARGET_GRID_ONLY_LIVEBOTTOM = [
+    ["Dense live bottom",          "Sparse live bottom",   "Dense live bottom",        "Sparse live bottom"],
+    ["Dense live bottom",       "Sparse live bottom",  "Dense live bottom",           "Sparse live bottom"],
+    ["Dense live bottom",  "Sparse live bottom",            "Dense live bottom", "Sparse live bottom"],
+    ["Sparse live bottom", "Dense live bottom",         "Sparse live bottom",  "Dense live bottom"]
+]
+
+TARGET_GRID_EVERYTHING = [
+    ["Sparse live bottom",          "Rippled sand",   "Rippled sand",        "Rippled sand"],
+    ["Dense live bottom",       "Sparse live bottom",  "Flat sand",           "Flat sand"],
+    ["Sparse live bottom",  "Rippled sand",            "Flat sand", "Rippled sand"],
+    ["Sparse live bottom", "Rippled sand",         "Flat sand",  "Rippled sand"]
+]
+
+DWELL_TIME                = 0.25   # Hold this long to trigger audio (listen) or evaluation (check)
+LIFT_CONFIRM_TIME         = 0.20   # Absent this long to confirm lift (used only to end LISTEN mode)
+HAND_CONFIDENCE_THRESHOLD = 0.80
+
+# A fingertip only counts as a real "touch" if the finger is actually extended - not curled
+# under the palm. Extended = tip is at least this many times farther from the wrist than that
+# finger's PIP joint is. Raise it if curled fingers still get picked up; lower it if a fully
+# extended finger is sometimes being missed.
+FINGER_EXTENDED_MARGIN    = 1.15
+
+# -------------------------------------------------------------------
+# 2. AUDIO INITIALIZATION
+# -------------------------------------------------------------------
+pygame.mixer.pre_init(44100, -16, 2, 512)
+pygame.init()
+pygame.mixer.init()
+pygame.mixer.set_num_channels(16)
+
+HABITAT_CHANNEL = pygame.mixer.Channel(0)
+EVAL_CHANNEL    = pygame.mixer.Channel(1)
+
+HABITAT_SOUND_PATHS = {
+    "Sparse live bottom": "Sounds_VF/BASIC_v3/BASIC-BASIC-sparse-live-8bars.wav",
+    "Rippled sand":       "Sounds_VF/BASIC_v3/BASIC-BASIC-rippled-sand-8bars-v3.wav",
+    "Flat sand":          "Sounds_VF/BASIC_v3/BASIC-BASIC-flat-sand-8bars-v3.wav",
+    "Dense live bottom":  "Sounds_VF/BASIC_v3/BASIC-BASIC-dense-live-8bars-v3.wav",
+    "correct":            "sounds/right_2.mp3",
+    "wrong":              "sounds/wrong.mp3"
+}
+
+LOADED_SOUNDS = {}
+print("\n--- AUDIO INITIALIZATION CHECK ---")
+for key, path in HABITAT_SOUND_PATHS.items():
+    if os.path.exists(path):
+        try:
+            LOADED_SOUNDS[key] = pygame.mixer.Sound(path)
+            print(f"  [OK]      {key}")
+        except Exception as e:
+            print(f"  [ERROR]   {key}: {e}")
+    else:
+        print(f"  [MISSING] {key}: {os.path.abspath(path)}")
+print("----------------------------------\n")
+
+
+# -------------------------------------------------------------------
+# 3. HELPERS & MAP RENDERING
+# -------------------------------------------------------------------
+def detect_cube_color(crop_bgr):
+    if crop_bgr is None or crop_bgr.size == 0:
+        return "Unknown"
+    hsv        = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    max_pixels = 0
+    detected   = "Unknown"
+    for name, (lower, upper) in COLOR_HSV_RANGES.items():
+        mask  = cv2.inRange(hsv, lower, upper)
+        count = cv2.countNonZero(mask)
+        if count > max_pixels and count > (crop_bgr.shape[0] * crop_bgr.shape[1] * 0.15):
+            max_pixels = count
+            detected   = name
+    return detected
+
+
+def get_camera_stream():
+    for idx in [1, 0, 2]:
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                print(f"Connected to camera index {idx}")
+                return cap
+            cap.release()
+    return None
+
+
+def _landmark_dist(a, b):
+    return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5
+
+
+def _is_finger_extended(lms, tip_id, pip_id, wrist_id=mp.solutions.hands.HandLandmark.WRIST):
+    """A curled finger's tip folds back toward the wrist, so its tip-to-wrist distance shrinks
+    below its PIP-to-wrist distance. This check is orientation-invariant (no reliance on 'up'),
+    which matters here since the camera looks straight down and hands can be rotated any way."""
+    wrist = lms.landmark[wrist_id]
+    tip   = lms.landmark[tip_id]
+    pip   = lms.landmark[pip_id]
+    return _landmark_dist(wrist, tip) > _landmark_dist(wrist, pip) * FINGER_EXTENDED_MARGIN
+
+
+def get_finger_tips(results, frame_w, frame_h):
+    """Returns index + middle fingertip positions for every confidently-tracked hand, but only
+    for fingers that are actually extended. This lets a visitor make a 'two finger' touch with
+    one hand (index + middle together) just as well as with two separate hands, while ignoring
+    curled fingers that MediaPipe still reports a (meaningless) landmark position for."""
+    tips = []
+    tip_pip_pairs = (
+        (mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP,  mp.solutions.hands.HandLandmark.INDEX_FINGER_PIP),
+        (mp.solutions.hands.HandLandmark.MIDDLE_FINGER_TIP, mp.solutions.hands.HandLandmark.MIDDLE_FINGER_PIP),
+    )
+    if results.multi_hand_landmarks and results.multi_handedness:
+        for lms, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+            if handedness.classification[0].score < HAND_CONFIDENCE_THRESHOLD:
+                continue
+            for tip_id, pip_id in tip_pip_pairs:
+                if not _is_finger_extended(lms, tip_id, pip_id):
+                    continue
+                tip    = lms.landmark[tip_id]
+                fx, fy = int(tip.x * frame_w), int(tip.y * frame_h)
+                if 0 <= fx < frame_w and 0 <= fy < frame_h:
+                    tips.append((fx, fy))
+    return tips
+
+
+def draw_map_display(revealed_grid, active_cell, status_msg, status_color, width=800, height=800):
+    """Generates the clean visitor-facing exhibit screen showing the pixelated seafloor map."""
+    map_img = np.zeros((height, width, 3), dtype=np.uint8)
+    
+    # Title Header
+    cv2.putText(map_img, "Sea Floor Habitat Map", (40, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # Grid Placement Area
+    start_x, start_y = 50, 80
+    grid_size = min(width - 100, height - 200)
+    cell_w = grid_size // GRID_COLS
+    cell_h = grid_size // GRID_ROWS
+
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            x1 = start_x + c * cell_w
+            y1 = start_y + r * cell_h
+            x2 = x1 + cell_w
+            y2 = y1 + cell_h
+
+            habitat_type = TARGET_GRID_HABITATS[r][c]
+            is_revealed  = revealed_grid[r][c]
+
+            # Choose fill color
+            if is_revealed:
+                color = HABITAT_DISPLAY_COLORS.get(habitat_type, (200, 200, 200))
+            else:
+                color = HABITAT_DISPLAY_COLORS["Grey"]
+
+            # Draw Pixel Cell
+            cv2.rectangle(map_img, (x1, y1), (x2, y2), color, -1)
+            
+            # Highlight cell currently being touched
+            if active_cell == (r, c):
+                cv2.rectangle(map_img, (x1, y1), (x2, y2), (0, 255, 255), 6)
+            else:
+                cv2.rectangle(map_img, (x1, y1), (x2, y2), (30, 30, 30), 2)
+
+            # Label revealed cells
+            if is_revealed:
+                cv2.putText(map_img, habitat_type, (x1 + 10, y1 + cell_h // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
+
+    # Status Bar Footer
+    footer_y = start_y + grid_size + 50
+    cv2.putText(map_img, status_msg, (40, footer_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2, cv2.LINE_AA)
+
+    # Check if map is 100% completed
+    if all(all(row) for row in revealed_grid):
+        cv2.putText(map_img, "SANCTUARY MAP FULLY REVEALED!", (40, footer_y + 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2, cv2.LINE_AA)
+
+    return map_img
+
+
+# -------------------------------------------------------------------
+# 4. MAIN LOOP
+# -------------------------------------------------------------------
+def main():
+    cap = get_camera_stream()
+    if cap is None:
+        print("Error: could not open camera.")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    aruco_dict   = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
+    aruco_params = aruco.DetectorParameters()
+
+    mp_hands_mod = mp.solutions.hands
+    hands        = mp_hands_mod.Hands(
+        max_num_hands=2,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.7
+    )
+    mp_draw = mp.solutions.drawing_utils
+
+    # Map State (False = Grey / Unrevealed, True = Color / Revealed)
+    revealed_grid = [[False for _ in range(GRID_COLS)] for _ in range(GRID_ROWS)]
+
+    # Interaction state
+    # hover_mode: 'listen' (2 fingers -> play habitat sound) or 'check' (1 finger -> evaluate cube)
+    hovered_cell      = None
+    hover_start       = None
+    hover_mode        = None
+
+    playing_cell      = None   # cell currently looping habitat audio (listen mode)
+
+    finger_in_cell    = False
+    absent_since      = None
+
+    locked            = False
+
+    status_msg   = "Two fingers = hear the habitat. One finger = check your answer."
+    status_color = (255, 255, 255)
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            time.sleep(0.1)
+            continue
+
+        now     = time.time()
+        h, w, _ = frame.shape
+
+        # ---- ArUco ----
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = aruco.detectMarkers(gray, aruco_dict, parameters=aruco_params)
+
+        pt1, pt2 = None, None
+        if ids is not None:
+            aruco.drawDetectedMarkers(frame, corners, ids)
+            for i, mid in enumerate(ids.flatten()):
+                c = corners[i][0]
+                if mid == 45:
+                    pt1 = (int(c[:, 0].mean()), int(c[:, 1].mean()))
+                elif mid == 57:
+                    pt2 = (int(c[:, 0].mean()), int(c[:, 1].mean()))
+
+        # ---- Hand tracking ----
+        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        tips    = get_finger_tips(results, w, h)
+
+        if results.multi_hand_landmarks and results.multi_handedness:
+            for lms, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+                if handedness.classification[0].score >= HAND_CONFIDENCE_THRESHOLD:
+                    mp_draw.draw_landmarks(frame, lms, mp_hands_mod.HAND_CONNECTIONS)
+
+        for fx, fy in tips:
+            cv2.circle(frame, (fx, fy), 8, (255, 0, 255), -1)
+
+        # ---- Grid ----
+        if pt1 and pt2:
+            mx1, mx2 = min(pt1[0], pt2[0]), max(pt1[0], pt2[0])
+            my1, my2 = min(pt1[1], pt2[1]), max(pt1[1], pt2[1])
+            sx, sy   = mx2 - mx1, my2 - my1
+
+            gx1 = int(mx1 + sx * GRID_OFFSET_LEFT)
+            gy1 = int(my1 + sy * GRID_OFFSET_TOP)
+            gx2 = int(mx2 - sx * GRID_OFFSET_RIGHT)
+            gy2 = int(my2 - sy * GRID_OFFSET_BOTTOM)
+
+            cv2.rectangle(frame, (gx1, gy1), (gx2, gy2), (255, 0, 0), 2)
+
+            cw = (gx2 - gx1) / GRID_COLS
+            ch = (gy2 - gy1) / GRID_ROWS
+
+            current_cell         = None
+            current_crop         = None
+            current_tips_in_cell = []
+
+            for r in range(GRID_ROWS):
+                for c in range(GRID_COLS):
+                    cx1 = int(gx1 + c * cw);       cy1 = int(gy1 + r * ch)
+                    cx2 = int(gx1 + (c+1) * cw);   cy2 = int(gy1 + (r+1) * ch)
+
+                    ix1 = int(cx1 + (cx2-cx1)*0.2); iy1 = int(cy1 + (cy2-cy1)*0.2)
+                    ix2 = int(cx1 + (cx2-cx1)*0.8); iy2 = int(cy1 + (cy2-cy1)*0.8)
+
+                    cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (255, 255, 0), 1)
+
+                    tips_here = [(fx, fy) for fx, fy in tips if cx1 <= fx <= cx2 and cy1 <= fy <= cy2]
+                    if tips_here:
+                        current_cell         = (r, c)
+                        current_crop         = frame[iy1:iy2, ix1:ix2].copy()
+                        current_tips_in_cell = tips_here
+                        cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (0, 255, 255), 2)
+
+            # Number of fingertips resting on the currently touched cell.
+            # 2 fingers -> visitor wants to LISTEN to the habitat sound.
+            # 1 finger  -> visitor wants to CHECK whether their rotation is correct.
+            current_finger_count = len(current_tips_in_cell)
+
+            # ==============================================================
+            # STATE MACHINE
+            # ==============================================================
+
+            # PHASE 3: Locked while evaluation audio plays
+            if locked:
+                if not EVAL_CHANNEL.get_busy():
+                    locked = False
+
+            # PHASE 2: LISTEN mode active - sound loops while 2+ fingers stay on the cell
+            elif playing_cell is not None:
+                now_in_cell = (current_cell == playing_cell and current_finger_count >= 2)
+
+                if now_in_cell:
+                    finger_in_cell = True
+                    absent_since   = None
+                else:
+                    if finger_in_cell:
+                        if absent_since is None:
+                            absent_since = now
+                    finger_in_cell = False
+
+                    if absent_since is not None and (now - absent_since) >= LIFT_CONFIRM_TIME:
+                        print(f"[LISTEN ENDED] cell {playing_cell}")
+                        HABITAT_CHANNEL.stop()
+
+                        playing_cell   = None
+                        finger_in_cell = False
+                        absent_since   = None
+                        hovered_cell   = None
+                        hover_start    = None
+                        hover_mode     = None
+
+                        # Listening never evaluates the cube - just return to idle.
+                        status_msg   = "Two fingers = hear the habitat. One finger = check your answer."
+                        status_color = (255, 255, 255)
+
+            # PHASE 1: Dwell, then branch into LISTEN (2+ fingers) or CHECK (1 finger, evaluates instantly)
+            else:
+                if current_cell is None or current_finger_count == 0:
+                    hovered_cell = None
+                    hover_start  = None
+                    hover_mode   = None
+                else:
+                    desired_mode = "listen" if current_finger_count >= 2 else "check"
+
+                    if current_cell != hovered_cell or desired_mode != hover_mode:
+                        hovered_cell = current_cell
+                        hover_mode   = desired_mode
+                        hover_start  = now
+
+                    dwell = now - hover_start
+
+                    if current_tips_in_cell:
+                        avg_x = int(sum(fx for fx, fy in current_tips_in_cell) / len(current_tips_in_cell))
+                        avg_y = int(sum(fy for fx, fy in current_tips_in_cell) / len(current_tips_in_cell))
+                        progress   = min(1.0, dwell / DWELL_TIME)
+                        ring_color = (0, 255, 255) if hover_mode == "listen" else (255, 0, 255)
+                        cv2.circle(frame, (avg_x, avg_y), int(8 + progress * 12), ring_color, 2)
+
+                    if dwell >= DWELL_TIME:
+                        r_h, c_h = hovered_cell
+                        habitat  = TARGET_GRID_HABITATS[r_h][c_h]
+
+                        if hover_mode == "listen":
+                            playing_cell   = hovered_cell
+                            finger_in_cell = True
+                            absent_since   = None
+
+                            if habitat in LOADED_SOUNDS:
+                                HABITAT_CHANNEL.play(LOADED_SOUNDS[habitat], loops=-1)
+
+                            print(f"[LISTENING] cell ({r_h},{c_h}): {habitat}")
+                            status_msg   = f"Listening to Cube ({r_h+1},{c_h+1})"
+                            status_color = (0, 255, 255)
+                        else:
+                            # CHECK: evaluate immediately - no lift or debounce required.
+                            target   = habitat
+                            detected = detect_cube_color(current_crop)
+
+                            print(f"[EVAL] cell ({r_h},{c_h}) target={target} detected={detected}")
+
+                            if detected == target:
+                                status_msg   = f"Cube ({r_h+1},{c_h+1}) CORRECT: {target}"
+                                status_color = (0, 255, 0)
+
+                                # REVEAL PIXEL ON MAP DISPLAY
+                                revealed_grid[r_h][c_h] = True
+
+                                if "correct" in LOADED_SOUNDS:
+                                    EVAL_CHANNEL.play(LOADED_SOUNDS["correct"])
+                            else:
+                                status_msg   = f"Cube ({r_h+1},{c_h+1}) INCORRECT: Facing {detected}, expected {target}"
+                                status_color = (0, 0, 255)
+                                if "wrong" in LOADED_SOUNDS:
+                                    EVAL_CHANNEL.play(LOADED_SOUNDS["wrong"])
+
+                            locked = True
+
+                        hovered_cell = None
+                        hover_start  = None
+                        hover_mode   = None
+
+        else:
+            cv2.putText(frame, "Waiting for ArUco markers 45 and 57...",
+                        (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+
+        # Draw Visitor Map Display Window
+        active_cell = playing_cell if playing_cell else hovered_cell
+        map_window  = draw_map_display(revealed_grid, active_cell, status_msg, status_color)
+        
+        cv2.imshow("Aquarium Map Display", map_window)
+
+        # Draw Debug Camera Window
+        cv2.putText(frame, status_msg, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+        cv2.imshow("Camera View (Debug)", frame)
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

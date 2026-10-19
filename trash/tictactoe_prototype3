@@ -1,0 +1,930 @@
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import mediapipe as mp
+import pygame
+import time
+import os
+from collections import deque
+
+# -------------------------------------------------------------------
+# 1. CONFIGURATION & COLOR DEFINITIONS
+# -------------------------------------------------------------------
+COLOR_HSV_RANGES = {
+    # "Rippled sand":       (np.array([5, 125, 167]), np.array([22, 216, 252])),
+    # "Dense live bottom":  (np.array([69, 4, 108]),   np.array([89, 96, 198])),
+    # "Flat sand":          (np.array([10, 90, 204]),  np.array([27, 176, 255])),
+    # "Sparse live bottom": (np.array([81, 18, 182]),  np.array([100, 107, 255]))
+    # "Rippled sand": (np.array([7, 107, 91]), np.array([24, 193, 173])),
+    # "Dense live bottom": (np.array([86, 121, 47]), np.array([103, 210, 130])),
+    # "Flat sand": (np.array([13, 57, 136]), np.array([30, 140, 222])),
+    "Rippled sand": (np.array([5, 96, 77]), np.array([25, 237, 237])),
+    "Dense live bottom": (np.array([61, 22, 25]), np.array([105, 165, 177])),
+    "Flat sand": (np.array([13, 103, 201]), np.array([29, 189, 255])),
+    "Sparse live bottom": (np.array([47, 23, 118]), np.array([104, 159, 255]))
+    # "Sparse live bottom": (np.array([89, 91, 153]), np.array([105, 175, 239])),
+}
+
+# Display Colors for the Map Screen (BGR format)
+HABITAT_DISPLAY_COLORS = {
+    "Flat sand":          (120, 215, 255),  # Soft Yellow
+    "Rippled sand":       (60, 180, 240),   # Warm Amber
+    "Sparse live bottom": (120, 200, 120),  # Light Sea Green
+    "Dense live bottom":  (40, 130, 40),    # Deep Forest Green
+    "Grey":               (100, 100, 100)   # Unrevealed Grey
+}
+
+GRID_ROWS = 4
+GRID_COLS = 4
+
+# ---------------------------------------------------------------
+# Custom macro-map artwork (replaces the procedural 2x2 zone grid)
+# ---------------------------------------------------------------
+# Both images must be the same size and pixel-aligned with each other:
+#   MACRO_MAP_HOLES_PATH -> the "before" map, with each zone shown as a hole
+#                            (this is the base/background that's always drawn).
+#   MACRO_MAP_OG_PATH    -> the fully-restored "after" artwork. When a zone is
+#                            completed, the matching crop of this image is
+#                            pasted into that zone's hole on top of the base.
+# Both are loaded from the same folder as this script.
+MACRO_MAP_HOLES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "holes_map.png")
+MACRO_MAP_OG_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Og_map.png")
+
+# Rendered size of the macro map window. The source art is cropped to its
+# non-transparent content region, then resized to this width; height is
+# derived automatically to preserve the art's aspect ratio.
+MACRO_MAP_DISPLAY_WIDTH = 900
+
+# The 5 hole locations, as (x0, y0, x1, y1) pixel boxes in the ORIGINAL,
+# un-cropped source image's coordinate space (same space for both images
+# above, since they're pixel-aligned). These were measured directly from
+# the "Delimited_squares_map" reference image against a 1950x1950 canvas.
+# If you re-export the artwork at a different canvas size, rescale these too.
+MACRO_MAP_SOURCE_SIZE = 1950
+ZONE_BOXES_RAW = [
+    (311,  412,  413,  519),   # Zone 1
+    (1168, 543,  1275, 651),   # Zone 2
+    (674,  775,  782,  882),   # Zone 3
+    (1013, 984,  1119, 1092),  # Zone 4
+    (365,  1013, 468,  1121),  # Zone 5
+]
+
+# Each value is a FRACTION of the marker-to-marker span (pt1<->pt2), pulling that
+# edge of the playable grid in from the raw marker bounding box.
+#   - Smaller value  -> that edge moves OUT, closer to (or past) the marker -> bigger grid
+#   - Larger value   -> that edge moves IN, further from the marker -> smaller grid
+#   - Can go negative to push the grid boundary beyond the marker itself.
+GRID_OFFSET_LEFT   = 0.01   # inset from marker 45's side (left edge)
+GRID_OFFSET_TOP    = 0.07   # inset from marker 45's side (top edge)
+GRID_OFFSET_RIGHT  = 0.01   # inset from marker 57's side (right edge)
+GRID_OFFSET_BOTTOM = 0.20
+
+# Each zone's own 4x4 habitat layout — this is where you decide what habitat sits in
+# each cell of each hole. Index 0 = Zone 1, index 1 = Zone 2, and so on (must have one
+# entry per hole in ZONE_BOXES_RAW). Each entry is a GRID_ROWS x GRID_COLS grid using
+# any of the habitat names from HABITAT_DISPLAY_COLORS / HABITAT_SOUND_PATHS above
+# ("Flat sand", "Rippled sand", "Sparse live bottom", "Dense live bottom").
+#
+# There's no requirement that a zone be a Latin square (each habitat once per row/col) -
+# that was just a convenient way to auto-generate varied-but-balanced layouts. Feel free
+# to hand-pick layouts that match what's actually around each hole in your artwork.
+ZONE_HABITAT_LAYOUTS = [
+    # Zone 1
+    [
+        ["Flat sand",          "Rippled sand",  "Rippled sand",        "Rippled sand"],
+        ["Rippled sand",       "Rippled sand", "Rippled sand",           "Rippled sand"],
+        ["Rippled sand",  "Rippled sand",           "Rippled sand", "Rippled sand"],
+        ["Rippled sand", "Rippled sand",        "Rippled sand",  "Rippled sand"],
+    ],
+    # Zone 2
+    [
+        ["Rippled sand",       "Rippled sand", "Flat sand",           "Flat sand"],
+        ["Rippled sand",  "Flat sand",           "Rippled sand", "Rippled sand"],
+        ["Flat sand", "Rippled sand",        "Rippled sand",  "Rippled sand"],
+        ["Rippled sand",          "Rippled sand",   "Rippled sand",       "Rippled sand"],
+    ],
+    # Zone 3
+    [
+        ["Rippled sand",  "Flat sand",           "Flat sand", "Flat sand"],
+        ["Flat sand", "Flat sand",        "Dense live bottom",  "Rippled sand"],
+        ["Flat sand",          "Dense live bottom",   "Dense live bottom",       "Rippled sand"],
+        ["Dense live bottom",       "Dense live bottom",  "Dense live bottom",          "Dense live bottom"],
+    ],
+    # Zone 4
+    [
+        ["Dense live bottom",          "Sparse live bottom",        "Dense live bottom",  "Sparse live bottom"],
+        ["Sparse live bottom",  "Sparse live bottom",  "Sparse live bottom",          "Sparse live bottom"],
+        ["Sparse live bottom",       "Sparse live bottom",            "Sparse live bottom", "Sparse live bottom"],
+        ["Sparse live bottom", "Dense live bottom",   "Sparse live bottom",       "Dense live bottom"],
+    ],
+    # Zone 5
+    [
+        ["Sparse live bottom",          "Rippled sand",        "Rippled sand",  "Rippled sand"],
+        ["Dense live bottom",  "Sparse live bottom",  "Flat sand",          "Flat sand"],
+        ["Sparse live bottom",       "Rippled sand",            "Flat sand", "Rippled sand"],
+        ["Sparse live bottom", "Rippled sand",   "Flat sand",       "Rippled sand"],
+    ],
+]
+
+# ---- Macro / Micro exhibit flow -----------------------------------
+# The sanctuary map is the custom artwork above, with 5 "zones" cut into it as holes
+# (see ZONE_BOXES_RAW). Each zone is restored one at a time on the physical board
+# (GRID_ROWS x GRID_COLS). Only one zone is "active" on the physical board at once.
+
+# How long (seconds) the zone-complete success screen stays up before auto-returning to
+# the macro sanctuary map.
+ZONE_COMPLETE_DISPLAY_TIME = 3.0
+
+
+def _scale_zone_boxes(raw_boxes, source_size, display_width, display_height,
+                       content_origin, content_size):
+    """Converts ZONE_BOXES_RAW (pixel coords in the original, un-cropped source image)
+    into pixel coords on the rendered macro-map canvas, accounting for the crop-to-content
+    step and the resize-to-display-size step done in load_macro_map_assets()."""
+    ox, oy = content_origin
+    cw, ch = content_size
+    scale_x = display_width  / cw
+    scale_y = display_height / ch
+
+    scaled = []
+    for (x0, y0, x1, y1) in raw_boxes:
+        dx0 = int(round((x0 - ox) * scale_x))
+        dy0 = int(round((y0 - oy) * scale_y))
+        dx1 = int(round((x1 - ox) * scale_x))
+        dy1 = int(round((y1 - oy) * scale_y))
+        scaled.append((dx0, dy0, dx1, dy1))
+    return scaled
+
+
+def build_zones(zone_boxes):
+    """Builds the 5 restorable zones that make up the sanctuary map, one per hole
+    in the custom artwork (zone_boxes, already scaled to the display canvas). Each
+    zone's habitat grid comes straight from ZONE_HABITAT_LAYOUTS above."""
+    if len(zone_boxes) != len(ZONE_HABITAT_LAYOUTS):
+        raise ValueError(
+            f"ZONE_BOXES_RAW has {len(zone_boxes)} holes but ZONE_HABITAT_LAYOUTS has "
+            f"{len(ZONE_HABITAT_LAYOUTS)} layouts - these lists must be the same length "
+            f"and in the same order."
+        )
+
+    zones = []
+    for i, box in enumerate(zone_boxes):
+        zones.append({
+            "id":         i + 1,
+            "box":        box,   # (x0, y0, x1, y1) on the rendered macro-map canvas
+            "habitats":   ZONE_HABITAT_LAYOUTS[i],
+            "revealed":   [[False for _ in range(GRID_COLS)] for _ in range(GRID_ROWS)],
+            "completed":  False,
+        })
+    return zones
+
+DWELL_TIME                = 0.25   # Hold this long to trigger audio (listen) or evaluation (check)
+LIFT_CONFIRM_TIME         = 0.20   # Absent this long to confirm lift (used only to end LISTEN mode)
+HAND_CONFIDENCE_THRESHOLD = 0.80
+
+# While in CHECK dwell (2 fingers hovering a cell), we buffer up to this many recent
+# (crop, tip positions) samples and, once dwell completes, evaluate using whichever
+# buffered frame had the LEAST finger occlusion - rather than only the exact frame at
+# the moment the dwell timer expired, which is close to worst-case for occlusion since
+# that's precisely when both fingers are settled on the cube.
+CHECK_CROP_BUFFER_SIZE = 10
+
+# Shows two extra debug windows ("Eval Crop" / "Eval Mask") at the moment a CHECK
+# evaluation runs, so you can see exactly what pixels the classifier scored.
+SHOW_EVAL_DEBUG = True
+
+# A fingertip only counts as a real "touch" if the finger is actually extended - not curled
+# under the palm. Extended = tip is at least this many times farther from the wrist than that
+# finger's PIP joint is. Raise it if curled fingers still get picked up; lower it if a fully
+# extended finger is sometimes being missed.
+FINGER_EXTENDED_MARGIN    = 1.15
+
+# -------------------------------------------------------------------
+# 2. AUDIO INITIALIZATION
+# -------------------------------------------------------------------
+pygame.mixer.pre_init(44100, -16, 2, 512)
+pygame.init()
+pygame.mixer.init()
+pygame.mixer.set_num_channels(16)
+
+HABITAT_CHANNEL = pygame.mixer.Channel(0)
+EVAL_CHANNEL    = pygame.mixer.Channel(1)
+
+HABITAT_SOUND_PATHS = {
+    "Sparse live bottom": "Sounds_VF/BASIC_v3/BASIC-BASIC-sparse-live-8bars.wav",
+    "Rippled sand":       "Sounds_VF/BASIC_v3/BASIC-BASIC-rippled-sand-8bars-v3.wav",
+    "Flat sand":          "Sounds_VF/BASIC_v3/BASIC-BASIC-flat-sand-8bars-v3.wav",
+    "Dense live bottom":  "Sounds_VF/BASIC_v3/BASIC-BASIC-dense-live-8bars-v3.wav",
+    "correct":            "sounds/right_2.mp3",
+    "wrong":              "sounds/wrong3.mp3",
+    # Optional cues for the macro/micro flow. Missing files are fine - they're just logged
+    # below and skipped; add real recordings/chimes at these paths to enable them.
+    "zone_select":        "sounds/zone_select.mp3",
+    "zone_complete":      "sounds/zone_complete.mp3",
+}
+
+LOADED_SOUNDS = {}
+print("\n--- AUDIO INITIALIZATION CHECK ---")
+for key, path in HABITAT_SOUND_PATHS.items():
+    if os.path.exists(path):
+        try:
+            LOADED_SOUNDS[key] = pygame.mixer.Sound(path)
+            print(f"  [OK]      {key}")
+        except Exception as e:
+            print(f"  [ERROR]   {key}: {e}")
+    else:
+        print(f"  [MISSING] {key}: {os.path.abspath(path)}")
+print("----------------------------------\n")
+
+
+# -------------------------------------------------------------------
+# 3. HELPERS & MAP RENDERING
+# -------------------------------------------------------------------
+# How large a circle (pixels, in crop-local coordinates) to blank out around each
+# reported fingertip position before scoring cube color. This exists because a
+# fingertip resting on/near the cube during CHECK mode otherwise gets counted as
+# "not matching any habitat color", which drags every color's match percentage down
+# and can push the whole evaluation to "Unknown" even when the cube itself is in
+# range. Raise this if fingers/shadow still leak into evaluations; lower it if it's
+# eating too much of a small crop and starving real matches.
+FINGER_EXCLUDE_RADIUS = 22
+
+# Minimum fraction of the crop that must remain visible (i.e. not blanked out as
+# finger) for an evaluation to be trusted at all. Below this, we don't even try to
+# classify - two fingers pressed on a small crop can leave almost nothing real to see.
+MIN_VISIBLE_FRACTION = 0.25
+
+
+def build_finger_exclusion_mask(crop_shape, tip_positions_local, radius=FINGER_EXCLUDE_RADIUS):
+    """Builds a mask (255 = usable, 0 = excluded) blanking out a circle around each
+    fingertip position, given in coordinates local to the crop (i.e. already offset
+    by the crop's top-left corner)."""
+    mask = np.full(crop_shape[:2], 255, dtype=np.uint8)
+    for (tx, ty) in (tip_positions_local or []):
+        cv2.circle(mask, (int(tx), int(ty)), radius, 0, -1)
+    return mask
+
+
+def detect_cube_color(crop_bgr, valid_mask=None):
+    """Classifies the dominant habitat color in crop_bgr. valid_mask, if given, is a
+    single-channel mask (255 = usable, 0 = ignore) the same size as crop_bgr - pass
+    build_finger_exclusion_mask(...) here to keep fingertip/occlusion pixels from
+    being scored as 'not this color' against every habitat."""
+    if crop_bgr is None or crop_bgr.size == 0:
+        return "Unknown", None, 0.0
+
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+
+    if valid_mask is None:
+        valid_mask = np.full(crop_bgr.shape[:2], 255, dtype=np.uint8)
+
+    total_pixels = crop_bgr.shape[0] * crop_bgr.shape[1]
+    valid_pixels = cv2.countNonZero(valid_mask)
+
+    if total_pixels == 0 or (valid_pixels / total_pixels) < MIN_VISIBLE_FRACTION:
+        return "Unknown", valid_mask, (valid_pixels / total_pixels if total_pixels else 0.0)
+
+    max_pixels = 0
+    detected   = "Unknown"
+    for name, (lower, upper) in COLOR_HSV_RANGES.items():
+        mask  = cv2.inRange(hsv, lower, upper)
+        mask  = cv2.bitwise_and(mask, valid_mask)
+        count = cv2.countNonZero(mask)
+        if count > max_pixels and count > (valid_pixels * 0.15):
+            max_pixels = count
+            detected   = name
+    return detected, valid_mask, (valid_pixels / total_pixels if total_pixels else 0.0)
+
+
+def get_camera_stream():
+    for idx in [1, 0, 2]:
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                print(f"Connected to camera index {idx}")
+                return cap
+            cap.release()
+    return None
+
+
+def _landmark_dist(a, b):
+    return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5
+
+
+def _is_finger_extended(lms, tip_id, pip_id, wrist_id=mp.solutions.hands.HandLandmark.WRIST):
+    """A curled finger's tip folds back toward the wrist, so its tip-to-wrist distance shrinks
+    below its PIP-to-wrist distance. This check is orientation-invariant (no reliance on 'up'),
+    which matters here since the camera looks straight down and hands can be rotated any way."""
+    wrist = lms.landmark[wrist_id]
+    tip   = lms.landmark[tip_id]
+    pip   = lms.landmark[pip_id]
+    return _landmark_dist(wrist, tip) > _landmark_dist(wrist, pip) * FINGER_EXTENDED_MARGIN
+
+
+def get_finger_tips(results, frame_w, frame_h):
+    """Returns index + middle fingertip positions for every confidently-tracked hand, but only
+    for fingers that are actually extended. This lets a visitor make a 'two finger' touch with
+    one hand (index + middle together) just as well as with two separate hands, while ignoring
+    curled fingers that MediaPipe still reports a (meaningless) landmark position for."""
+    tips = []
+    tip_pip_pairs = (
+        (mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP,  mp.solutions.hands.HandLandmark.INDEX_FINGER_PIP),
+        (mp.solutions.hands.HandLandmark.MIDDLE_FINGER_TIP, mp.solutions.hands.HandLandmark.MIDDLE_FINGER_PIP),
+    )
+    if results.multi_hand_landmarks and results.multi_handedness:
+        for lms, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+            if handedness.classification[0].score < HAND_CONFIDENCE_THRESHOLD:
+                continue
+            for tip_id, pip_id in tip_pip_pairs:
+                if not _is_finger_extended(lms, tip_id, pip_id):
+                    continue
+                tip    = lms.landmark[tip_id]
+                fx, fy = int(tip.x * frame_w), int(tip.y * frame_h)
+                if 0 <= fx < frame_w and 0 <= fy < frame_h:
+                    tips.append((fx, fy))
+    return tips
+
+
+def draw_micro_grid(zone, active_cell, status_msg, status_color, width=800, height=800):
+    """Generates the zoomed-in screen for a single zone's N x M physical-board grid."""
+    map_img = np.zeros((height, width, 3), dtype=np.uint8)
+
+    habitats      = zone["habitats"]
+    revealed_grid = zone["revealed"]
+    rows, cols    = len(habitats), len(habitats[0])
+
+    # Title Header
+    cv2.putText(map_img, f"Restoring Zone {zone['id']}", (40, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # Grid Placement Area
+    start_x, start_y = 50, 80
+    grid_size = min(width - 100, height - 200)
+    cell_w = grid_size // cols
+    cell_h = grid_size // rows
+
+    for r in range(rows):
+        for c in range(cols):
+            x1 = start_x + c * cell_w
+            y1 = start_y + r * cell_h
+            x2 = x1 + cell_w
+            y2 = y1 + cell_h
+
+            habitat_type = habitats[r][c]
+            is_revealed  = revealed_grid[r][c]
+
+            # Choose fill color
+            if is_revealed:
+                color = HABITAT_DISPLAY_COLORS.get(habitat_type, (200, 200, 200))
+            else:
+                color = HABITAT_DISPLAY_COLORS["Grey"]
+
+            # Draw Pixel Cell
+            cv2.rectangle(map_img, (x1, y1), (x2, y2), color, -1)
+
+            # Highlight cell currently being touched
+            if active_cell == (r, c):
+                cv2.rectangle(map_img, (x1, y1), (x2, y2), (0, 255, 255), 6)
+            else:
+                cv2.rectangle(map_img, (x1, y1), (x2, y2), (30, 30, 30), 2)
+
+            # Label revealed cells
+            if is_revealed:
+                cv2.putText(map_img, habitat_type, (x1 + 10, y1 + cell_h // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
+
+    # Status Bar Footer
+    footer_y = start_y + grid_size + 50
+    cv2.putText(map_img, status_msg, (40, footer_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2, cv2.LINE_AA)
+
+    return map_img
+
+
+def _content_bbox_from_alpha(rgba_img):
+    """Finds the bounding box of non-transparent pixels in an RGBA image, so the
+    artwork's blank/transparent margins can be cropped away before display."""
+    alpha = rgba_img[:, :, 3]
+    ys, xs = np.where(alpha > 10)
+    if len(xs) == 0:
+        h, w = rgba_img.shape[:2]
+        return (0, 0, w, h)
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    return (x0, y0, x1, y1)
+
+
+def load_macro_map_assets():
+    """Loads the custom holes/restored-artwork images, crops them to their shared
+    content region, resizes them to the display size, and scales ZONE_BOXES_RAW to
+    match. Returns (holes_img_bgr, og_img_bgr, zone_boxes_scaled, display_size)."""
+    holes_raw = cv2.imread(MACRO_MAP_HOLES_PATH, cv2.IMREAD_UNCHANGED)
+    og_raw    = cv2.imread(MACRO_MAP_OG_PATH,    cv2.IMREAD_UNCHANGED)
+
+    if holes_raw is None:
+        raise FileNotFoundError(f"Could not load macro map art: {MACRO_MAP_HOLES_PATH}")
+    if og_raw is None:
+        raise FileNotFoundError(f"Could not load macro map art: {MACRO_MAP_OG_PATH}")
+
+    # Determine the shared content region from whichever image has an alpha channel.
+    if holes_raw.shape[2] == 4:
+        x0, y0, x1, y1 = _content_bbox_from_alpha(holes_raw)
+    elif og_raw.shape[2] == 4:
+        x0, y0, x1, y1 = _content_bbox_from_alpha(og_raw)
+    else:
+        h, w = holes_raw.shape[:2]
+        x0, y0, x1, y1 = 0, 0, w, h
+
+    content_w, content_h = x1 - x0, y1 - y0
+
+    display_w = MACRO_MAP_DISPLAY_WIDTH
+    display_h = int(round(display_w * (content_h / content_w)))
+
+    def crop_resize(img):
+        cropped = img[y0:y1, x0:x1]
+        bgr     = cropped[:, :, :3] if cropped.shape[2] == 4 else cropped
+        return cv2.resize(bgr, (display_w, display_h), interpolation=cv2.INTER_AREA)
+
+    holes_img = crop_resize(holes_raw)
+    og_img    = crop_resize(og_raw)
+
+    zone_boxes = _scale_zone_boxes(
+        ZONE_BOXES_RAW, MACRO_MAP_SOURCE_SIZE,
+        display_w, display_h,
+        content_origin=(x0, y0), content_size=(content_w, content_h)
+    )
+
+    return holes_img, og_img, zone_boxes, (display_w, display_h)
+
+
+def draw_macro_map(zones, status_msg, status_color, holes_img, og_img):
+    """Generates the main sanctuary map from the custom artwork: each zone is either
+    left as a hole (from holes_img) waiting to be restored, or instantly filled in with
+    its matching crop of the fully-restored artwork (og_img) once completed."""
+    display_h, display_w = holes_img.shape[:2]
+    top_pad, bottom_pad = 60, 70
+
+    map_img = np.full((display_h + top_pad + bottom_pad, display_w, 3), (60, 45, 20), dtype=np.uint8)
+    map_img[top_pad:top_pad + display_h, :] = holes_img
+
+    cv2.putText(map_img, "Sanctuary Restoration Map", (30, 42),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+    for zone in zones:
+        x0, y0, x1, y1 = zone["box"]
+        y0 += top_pad
+        y1 += top_pad
+
+        if zone["completed"]:
+            map_img[y0:y1, x0:x1] = og_img[zone["box"][1]:zone["box"][3], zone["box"][0]:zone["box"][2]]
+            cv2.rectangle(map_img, (x0, y0), (x1, y1), (255, 255, 255), 2)
+        else:
+            cv2.rectangle(map_img, (x0, y0), (x1, y1), (30, 30, 30), 2)
+
+            label = str(zone["id"])
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+            lx = x0 + ((x1 - x0) - tw) // 2
+            ly = y0 + ((y1 - y0) + th) // 2
+            cv2.putText(map_img, label, (lx, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
+
+    footer_y = top_pad + display_h + 30
+    cv2.putText(map_img, status_msg, (30, footer_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2, cv2.LINE_AA)
+
+    if all(zone["completed"] for zone in zones):
+        cv2.putText(map_img, "SANCTUARY FULLY RESTORED!", (30, footer_y + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2, cv2.LINE_AA)
+
+    return map_img
+
+
+def draw_zone_complete(zone, width=800, height=800):
+    """Brief success screen shown after a zone's last cube is correctly matched, before
+    zooming back out to the macro sanctuary map."""
+    img = draw_micro_grid(zone, None, "", (255, 255, 255), width, height)
+
+    overlay = img.copy()
+    cv2.rectangle(overlay, (0, 0), (width, height), (0, 200, 0), -1)
+    img = cv2.addWeighted(overlay, 0.30, img, 0.70, 0)
+
+    text = f"ZONE {zone['id']} RESTORED!"
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.3, 3)
+    cv2.putText(img, text, ((width - tw)//2, height//2),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.3, (255, 255, 255), 3, cv2.LINE_AA)
+
+    return img
+
+
+# -------------------------------------------------------------------
+# 4. MAIN LOOP
+# -------------------------------------------------------------------
+def main():
+    cap = get_camera_stream()
+    if cap is None:
+        print("Error: could not open camera.")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    aruco_dict   = aruco.getPredefinedDictionary(aruco.DICT_4X4_100)
+    aruco_params = aruco.DetectorParameters()
+
+    mp_hands_mod = mp.solutions.hands
+    hands        = mp_hands_mod.Hands(
+        max_num_hands=2,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.7
+    )
+    mp_draw = mp.solutions.drawing_utils
+
+    # ---- Macro / Micro exhibit state ----
+    holes_img, og_img, zone_boxes, _ = load_macro_map_assets()
+    zones            = build_zones(zone_boxes)
+    app_state        = "MACRO"   # "MACRO" | "MICRO" | "ZONE_COMPLETE"
+    active_zone      = None
+    zone_complete_at = None
+
+    # Interaction state (only meaningful while app_state == "MICRO")
+    # hover_mode: 'listen' (1 finger -> play habitat sound) or 'check' (2 fingers -> evaluate cube)
+    hovered_cell      = None
+    hover_start       = None
+    hover_mode        = None
+
+    playing_cell      = None   # cell currently looping habitat audio (listen mode)
+
+    finger_in_cell    = False
+    absent_since      = None
+
+    locked            = False
+
+    # Rolling buffer of recent (crop, tip_positions_local) samples collected while
+    # dwelling in CHECK mode over hovered_cell, so evaluation can pick the least-
+    # occluded frame instead of only the exact frame the dwell timer expired on.
+    check_crop_buffer = deque(maxlen=CHECK_CROP_BUFFER_SIZE)
+
+    status_msg   = "Select a zone to restore: press 1-5."
+    status_color = (255, 255, 255)
+
+    # ---- Marker position cache ----
+    # The camera and physical board are static once the exhibit is running, so once
+    # we've seen marker 45 / 57 at least once we don't need to see them every single
+    # frame - we just reuse the last known-good position. This is what keeps the grid
+    # alive when a visitor's hand briefly covers a marker while touching a cube.
+    # Pressing 'c' clears the cache (e.g. if the board/camera really does get bumped),
+    # forcing both markers to be re-acquired live before the grid comes back.
+    cached_pt1, cached_pt2 = None, None
+
+    def reset_interaction_state():
+        nonlocal hovered_cell, hover_start, hover_mode, playing_cell, finger_in_cell, absent_since, locked
+        hovered_cell   = None
+        hover_start    = None
+        hover_mode     = None
+        playing_cell   = None
+        finger_in_cell = False
+        absent_since   = None
+        locked         = False
+        check_crop_buffer.clear()
+        HABITAT_CHANNEL.stop()
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            time.sleep(0.1)
+            continue
+
+        now     = time.time()
+        h, w, _ = frame.shape
+
+        # ---- ArUco ----
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = aruco.detectMarkers(gray, aruco_dict, parameters=aruco_params)
+
+        live_pt1, live_pt2 = None, None
+        if ids is not None:
+            aruco.drawDetectedMarkers(frame, corners, ids)
+            for i, mid in enumerate(ids.flatten()):
+                c = corners[i][0]
+                if mid == 45:
+                    live_pt1 = (int(c[:, 0].mean()), int(c[:, 1].mean()))
+                elif mid == 57:
+                    live_pt2 = (int(c[:, 0].mean()), int(c[:, 1].mean()))
+
+        # Update the cache whenever a marker is actually seen live, then fall back to
+        # the cache for any marker that isn't visible this frame (e.g. a hand over it).
+        if live_pt1 is not None:
+            cached_pt1 = live_pt1
+        if live_pt2 is not None:
+            cached_pt2 = live_pt2
+
+        pt1 = live_pt1 if live_pt1 is not None else cached_pt1
+        pt2 = live_pt2 if live_pt2 is not None else cached_pt2
+
+        # Debug feedback: show which markers are being read live vs from cache.
+        cache_note = f"45: {'live' if live_pt1 else ('cached' if pt1 else 'missing')}  |  " \
+                     f"57: {'live' if live_pt2 else ('cached' if pt2 else 'missing')}"
+        cv2.putText(frame, cache_note, (30, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 0), 1)
+
+        # ---- Hand tracking (always runs, for a continuous debug feed) ----
+        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        tips    = get_finger_tips(results, w, h)
+
+        if results.multi_hand_landmarks and results.multi_handedness:
+            for lms, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+                if handedness.classification[0].score >= HAND_CONFIDENCE_THRESHOLD:
+                    mp_draw.draw_landmarks(frame, lms, mp_hands_mod.HAND_CONNECTIONS)
+
+        for fx, fy in tips:
+            cv2.circle(frame, (fx, fy), 8, (255, 0, 255), -1)
+
+        # ==================================================================
+        # APP STATE MACHINE (Macro map <-> Micro board activity)
+        # ==================================================================
+
+        if app_state == "ZONE_COMPLETE":
+            cv2.putText(frame, f"Zone {active_zone['id']} restored! Returning to map...",
+                        (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            if now - zone_complete_at >= ZONE_COMPLETE_DISPLAY_TIME:
+                app_state    = "MACRO"
+                active_zone  = None
+                status_msg   = "Select a zone to restore: press 1-5."
+                status_color = (255, 255, 255)
+
+        elif app_state == "MICRO":
+            # ---- Grid ----
+            if pt1 and pt2:
+                mx1, mx2 = min(pt1[0], pt2[0]), max(pt1[0], pt2[0])
+                my1, my2 = min(pt1[1], pt2[1]), max(pt1[1], pt2[1])
+                sx, sy   = mx2 - mx1, my2 - my1
+
+                gx1 = int(mx1 + sx * GRID_OFFSET_LEFT)
+                gy1 = int(my1 + sy * GRID_OFFSET_TOP)
+                gx2 = int(mx2 - sx * GRID_OFFSET_RIGHT)
+                gy2 = int(my2 - sy * GRID_OFFSET_BOTTOM)
+
+                cv2.rectangle(frame, (gx1, gy1), (gx2, gy2), (255, 0, 0), 2)
+
+                cw = (gx2 - gx1) / GRID_COLS
+                ch = (gy2 - gy1) / GRID_ROWS
+
+                current_cell         = None
+                current_crop         = None
+                current_crop_origin  = None   # (ix1, iy1) of current_crop, for converting tip coords to crop-local space
+                current_tips_in_cell = []
+
+                for r in range(GRID_ROWS):
+                    for c in range(GRID_COLS):
+                        cx1 = int(gx1 + c * cw);       cy1 = int(gy1 + r * ch)
+                        cx2 = int(gx1 + (c+1) * cw);   cy2 = int(gy1 + (r+1) * ch)
+
+                        ix1 = int(cx1 + (cx2-cx1)*0.2); iy1 = int(cy1 + (cy2-cy1)*0.2)
+                        ix2 = int(cx1 + (cx2-cx1)*0.8); iy2 = int(cy1 + (cy2-cy1)*0.8)
+
+                        cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (255, 255, 0), 1)
+
+                        tips_here = [(fx, fy) for fx, fy in tips if cx1 <= fx <= cx2 and cy1 <= fy <= cy2]
+                        if tips_here:
+                            current_cell         = (r, c)
+                            current_crop         = frame[iy1:iy2, ix1:ix2].copy()
+                            current_crop_origin  = (ix1, iy1)
+                            current_tips_in_cell = tips_here
+                            cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (0, 255, 255), 2)
+
+                # Number of fingertips resting on the currently touched cell.
+                # 1 finger  -> visitor wants to LISTEN to the habitat sound (explore).
+                # 2 fingers -> visitor wants to CHECK whether their rotation is correct.
+                current_finger_count = len(current_tips_in_cell)
+
+                habitats      = active_zone["habitats"]
+                revealed_grid = active_zone["revealed"]
+
+                # ----------------------------------------------------------
+                # STATE MACHINE
+                # ----------------------------------------------------------
+
+                # PHASE 3: Locked while evaluation audio plays
+                if locked:
+                    if not EVAL_CHANNEL.get_busy():
+                        locked = False
+
+                # PHASE 2: LISTEN mode active - sound loops while >=1 finger stays on the cell
+                elif playing_cell is not None:
+                    now_in_cell = (current_cell == playing_cell and current_finger_count >= 1)
+
+                    if now_in_cell:
+                        finger_in_cell = True
+                        absent_since   = None
+                    else:
+                        if finger_in_cell:
+                            if absent_since is None:
+                                absent_since = now
+                        finger_in_cell = False
+
+                        if absent_since is not None and (now - absent_since) >= LIFT_CONFIRM_TIME:
+                            print(f"[LISTEN ENDED] cell {playing_cell}")
+                            HABITAT_CHANNEL.stop()
+
+                            playing_cell   = None
+                            finger_in_cell = False
+                            absent_since   = None
+                            hovered_cell   = None
+                            hover_start    = None
+                            hover_mode     = None
+
+                            # Listening never evaluates the cube - just return to idle.
+                            status_msg   = "One finger = hear the habitat. Two fingers = check your answer."
+                            status_color = (255, 255, 255)
+
+                # PHASE 1: Dwell, then branch into LISTEN (1 finger) or CHECK (2+ fingers, evaluates instantly)
+                else:
+                    if current_cell is None or current_finger_count == 0:
+                        hovered_cell = None
+                        hover_start  = None
+                        hover_mode   = None
+                    else:
+                        desired_mode = "check" if current_finger_count >= 2 else "listen"
+
+                        if current_cell != hovered_cell or desired_mode != hover_mode:
+                            hovered_cell = current_cell
+                            hover_mode   = desired_mode
+                            hover_start  = now
+                            check_crop_buffer.clear()
+
+                        dwell = now - hover_start
+
+                        # While dwelling toward a CHECK evaluation, keep buffering recent
+                        # (crop, local tip positions) samples so we can evaluate using the
+                        # least-occluded one once dwell completes, instead of only the exact
+                        # frame the dwell timer expired on.
+                        if hover_mode == "check" and current_crop is not None and current_crop_origin is not None:
+                            ox, oy = current_crop_origin
+                            local_tips = [(fx - ox, fy - oy) for fx, fy in current_tips_in_cell]
+                            check_crop_buffer.append((current_crop, local_tips))
+
+                        if current_tips_in_cell:
+                            avg_x = int(sum(fx for fx, fy in current_tips_in_cell) / len(current_tips_in_cell))
+                            avg_y = int(sum(fy for fx, fy in current_tips_in_cell) / len(current_tips_in_cell))
+                            progress   = min(1.0, dwell / DWELL_TIME)
+                            ring_color = (0, 255, 255) if hover_mode == "listen" else (255, 0, 255)
+                            cv2.circle(frame, (avg_x, avg_y), int(8 + progress * 12), ring_color, 2)
+
+                        if dwell >= DWELL_TIME:
+                            r_h, c_h = hovered_cell
+                            habitat  = habitats[r_h][c_h]
+
+                            if hover_mode == "listen":
+                                playing_cell   = hovered_cell
+                                finger_in_cell = True
+                                absent_since   = None
+
+                                if habitat in LOADED_SOUNDS:
+                                    HABITAT_CHANNEL.play(LOADED_SOUNDS[habitat], loops=-1)
+
+                                print(f"[LISTENING] cell ({r_h},{c_h}): {habitat}")
+                                status_msg   = f"Listening to Cube ({r_h+1},{c_h+1})"
+                                status_color = (0, 255, 255)
+                            else:
+                                # CHECK: evaluate immediately - no lift or debounce required.
+                                target = habitat
+
+                                # Pick the buffered frame with the LEAST finger occlusion
+                                # (i.e. the most visible-pixel fraction after masking out the
+                                # fingertip circles), rather than only the frame at the exact
+                                # moment dwell completed - that frame is close to worst-case
+                                # for occlusion since both fingers are settled by then.
+                                best_crop, best_mask, best_visible_frac = current_crop, None, -1.0
+                                if current_crop is not None:
+                                    ox, oy = current_crop_origin or (0, 0)
+                                    fallback_local_tips = [(fx - ox, fy - oy) for fx, fy in current_tips_in_cell]
+                                    fallback_mask = build_finger_exclusion_mask(current_crop.shape, fallback_local_tips)
+                                    best_crop, best_mask = current_crop, fallback_mask
+                                    best_visible_frac = cv2.countNonZero(fallback_mask) / fallback_mask.size
+
+                                for buf_crop, buf_local_tips in check_crop_buffer:
+                                    buf_mask = build_finger_exclusion_mask(buf_crop.shape, buf_local_tips)
+                                    visible_frac = cv2.countNonZero(buf_mask) / buf_mask.size
+                                    if visible_frac > best_visible_frac:
+                                        best_crop, best_mask, best_visible_frac = buf_crop, buf_mask, visible_frac
+
+                                detected, used_mask, visible_frac = detect_cube_color(best_crop, best_mask)
+
+                                if SHOW_EVAL_DEBUG and best_crop is not None:
+                                    cv2.imshow("Eval Crop", cv2.resize(best_crop, None, fx=4, fy=4,
+                                                                        interpolation=cv2.INTER_NEAREST))
+                                    if used_mask is not None:
+                                        cv2.imshow("Eval Mask", cv2.resize(used_mask, None, fx=4, fy=4,
+                                                                            interpolation=cv2.INTER_NEAREST))
+
+                                print(f"[EVAL] Zone {active_zone['id']} cell ({r_h},{c_h}) "
+                                      f"target={target} detected={detected} visible={visible_frac:.0%} "
+                                      f"(buffer had {len(check_crop_buffer)} samples)")
+
+                                if detected == target:
+                                    status_msg   = f"Cube ({r_h+1},{c_h+1}) CORRECT: {target}"
+                                    status_color = (0, 255, 0)
+
+                                    # REVEAL PIXEL ON MAP DISPLAY
+                                    revealed_grid[r_h][c_h] = True
+
+                                    if "correct" in LOADED_SOUNDS:
+                                        EVAL_CHANNEL.play(LOADED_SOUNDS["correct"])
+                                else:
+                                    status_msg   = f"Cube ({r_h+1},{c_h+1}) INCORRECT: Facing {detected}, expected {target}"
+                                    status_color = (0, 0, 255)
+                                    if "wrong" in LOADED_SOUNDS:
+                                        EVAL_CHANNEL.play(LOADED_SOUNDS["wrong"])
+
+                                locked = True
+                                check_crop_buffer.clear()
+
+                            hovered_cell = None
+                            hover_start  = None
+                            hover_mode   = None
+
+                # Zone complete? (checked after every evaluation, cheap to check every frame)
+                if all(all(row) for row in revealed_grid) and not active_zone["completed"]:
+                    active_zone["completed"] = True
+                    print(f"[ZONE COMPLETE] Zone {active_zone['id']}")
+
+                    if "zone_complete" in LOADED_SOUNDS:
+                        EVAL_CHANNEL.play(LOADED_SOUNDS["zone_complete"])
+                    elif "correct" in LOADED_SOUNDS:
+                        EVAL_CHANNEL.play(LOADED_SOUNDS["correct"])
+
+                    reset_interaction_state()
+                    app_state        = "ZONE_COMPLETE"
+                    zone_complete_at = now
+                    status_msg       = f"Zone {active_zone['id']} restored!"
+                    status_color     = (0, 255, 0)
+
+            else:
+                cv2.putText(frame, "Waiting for ArUco markers 45 and 57...",
+                            (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+
+        # else app_state == "MACRO": no board interaction is processed - waiting on zone selection.
+
+        # ---- Draw Sanctuary/Zone Display Window ----
+        if app_state == "MACRO":
+            map_window = draw_macro_map(zones, status_msg, status_color, holes_img, og_img)
+        elif app_state == "MICRO":
+            active_cell = playing_cell if playing_cell else hovered_cell
+            map_window  = draw_micro_grid(active_zone, active_cell, status_msg, status_color)
+        else:  # ZONE_COMPLETE
+            map_window = draw_zone_complete(active_zone)
+
+        cv2.imshow("Aquarium Map Display", map_window)
+
+        # ---- Draw Debug Camera Window ----
+        cv2.putText(frame, status_msg, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+        cv2.imshow("Camera View (Debug)", frame)
+
+        # ---- Input ----
+        # Zone selection here stands in for the touchscreen prompt / physical button described
+        # in the exhibit flow - wire that hardware event to call the same "select zone" logic.
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == 27:  # ESC
+            break
+
+        elif key in (ord('c'), ord('C')):
+            # Staff override: board/camera was actually moved - drop the cached marker
+            # positions so both must be freshly, live re-detected before the grid returns.
+            cached_pt1, cached_pt2 = None, None
+            print("[MARKER CACHE CLEARED] re-acquiring markers 45/57 live...")
+
+        elif app_state == "MACRO" and key in (ord('1'), ord('2'), ord('3'), ord('4'), ord('5')):
+            zone_id = key - ord('0')
+            zone    = next((z for z in zones if z["id"] == zone_id), None)
+
+            if zone is None:
+                pass
+            elif zone["completed"]:
+                status_msg   = f"Zone {zone_id} is already restored."
+                status_color = (0, 255, 255)
+            else:
+                active_zone = zone
+                app_state   = "MICRO"
+                reset_interaction_state()
+
+                if "zone_select" in LOADED_SOUNDS:
+                    EVAL_CHANNEL.play(LOADED_SOUNDS["zone_select"])
+
+                status_msg   = (f"Restoring Zone {zone_id}: touch the cubes on the board "
+                                 f"to identify and match the missing habitats.")
+                status_color = (255, 255, 255)
+
+        elif app_state == "MICRO" and key in (ord('b'), ord('B')):
+            # Staff/testing override: bail out to the macro map without finishing the zone.
+            app_state   = "MACRO"
+            active_zone = None
+            reset_interaction_state()
+            status_msg   = "Select a zone to restore: press 1-5."
+            status_color = (255, 255, 255)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

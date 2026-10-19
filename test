@@ -1,0 +1,11 @@
+using System;
+
+Ennemy ennemy = new();
+
+public class Ennemy
+{
+    public string name;
+    public int health;
+    public int attackDamage;
+
+}

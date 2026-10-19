@@ -1,0 +1,103 @@
+"""
+Minimal lift detection test — no audio, no ArUco, no evaluation logic.
+Just MediaPipe hand tracking over a single big rectangle.
+Watch the terminal. You should see:
+  [FINGER IN]  when your finger enters the box
+  [FINGER OUT] when it leaves
+  [LIFT CONFIRMED] after 200ms of absence
+
+If you never see [LIFT CONFIRMED] that tells us exactly what is broken.
+"""
+
+import cv2
+import mediapipe as mp
+import time
+
+LIFT_CONFIRM_TIME = 0.20
+HAND_CONFIDENCE_THRESHOLD = 0.80
+
+mp_hands = mp.solutions.hands
+hands    = mp_hands.Hands(
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+mp_draw = mp.solutions.drawing_utils
+
+cap = cv2.VideoCapture(1)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+finger_in_box       = False
+finger_absent_since = None
+lift_confirmed      = False
+
+BOX = (200, 150, 900, 550)   # x1, y1, x2, y2
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    now     = time.time()
+    h, w, _ = frame.shape
+
+    results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+    # --- collect high-confidence finger tips ---
+    finger_tips = []
+    if results.multi_hand_landmarks and results.multi_handedness:
+        for lms, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+            if handedness.classification[0].score < HAND_CONFIDENCE_THRESHOLD:
+                continue
+            mp_draw.draw_landmarks(frame, lms, mp_hands.HAND_CONNECTIONS)
+            tip    = lms.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            fx, fy = int(tip.x * w), int(tip.y * h)
+            if 0 <= fx < w and 0 <= fy < h:
+                finger_tips.append((fx, fy))
+                cv2.circle(frame, (fx, fy), 10, (255, 0, 255), -1)
+
+    # --- check if any tip is inside the box ---
+    x1, y1, x2, y2 = BOX
+    currently_in = any(x1 <= fx <= x2 and y1 <= fy <= y2 for fx, fy in finger_tips)
+
+    # --- state transitions ---
+    if currently_in:
+        if not finger_in_box:
+            print(f"[FINGER IN]  at {now:.3f}")
+        finger_in_box       = True
+        finger_absent_since = None
+        lift_confirmed      = False
+    else:
+        if finger_in_box:
+            # just left
+            if finger_absent_since is None:
+                finger_absent_since = now
+                print(f"[FINGER OUT] at {now:.3f}  (waiting {LIFT_CONFIRM_TIME}s to confirm lift)")
+        finger_in_box = False
+
+        if finger_absent_since is not None and not lift_confirmed:
+            elapsed = now - finger_absent_since
+            if elapsed >= LIFT_CONFIRM_TIME:
+                lift_confirmed = True
+                print(f"[LIFT CONFIRMED] after {elapsed:.3f}s absence")
+
+    # --- draw ---
+    color = (0, 255, 0) if currently_in else (0, 0, 255)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+    label = "FINGER IN" if currently_in else ("LIFT CONFIRMED" if lift_confirmed else "finger out")
+    cv2.putText(frame, label, (x1 + 10, y1 + 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+
+    # show raw landmark count so you can see ghost frames
+    raw_count = len(results.multi_hand_landmarks) if results.multi_hand_landmarks else 0
+    accepted  = len(finger_tips)
+    cv2.putText(frame, f"raw hands: {raw_count}  accepted: {accepted}", (20, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+
+    cv2.imshow("Lift Detection Test", frame)
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
