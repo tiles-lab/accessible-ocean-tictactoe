@@ -52,6 +52,51 @@ pip install -r requirements.txt
 
 **macOS:** the first time you run a script, macOS asks for camera access for your Terminal (or VS Code). Allow it, then restart the terminal.
 
+### Choosing the camera
+
+Both scripts ask which camera to use when they start, and list the cameras by name (on a Mac this needs `pyobjc-framework-AVFoundation`, which `requirements.txt` installs). Press **`v`** while a script is running to switch to the next camera.
+
+To skip the question (needed for the exhibit, so it starts on its own), pass `--camera`, or set `CAMERA_INDEX` near the top of the script:
+
+| `--camera` value | Uses |
+|---|---|
+| `orbbec` | the **Orbbec Gemini 2**'s color camera |
+| part of a name, e.g. `FaceTime` | the camera whose name contains that text |
+| a number, e.g. `0` | that camera number |
+
+```bash
+python hsv_calibration_tool.py --camera orbbec
+python tictactoe_prototype8.py --camera orbbec
+```
+
+On a Mac, prefer `orbbec` or a name over a number: camera numbers shift when an iPhone (Continuity Camera) or Desk View camera appears or disappears.
+
+### Orbbec Gemini 2
+
+The Gemini's **color** camera is reached through the Orbbec SDK. Install it once, **with `--no-deps`**: its dependencies include `opencv-python`, which would replace the `opencv-contrib-python` this project uses and break it.
+
+```bash
+python -m pip install --no-deps pyorbbecsdk2
+```
+
+**On a Mac**, macOS only exposes the Gemini's IR camera (greyscale) to normal programs. The SDK is the only way to get color, and it must run as administrator (Orbbec requires this on macOS):
+
+```bash
+sudo -E .venv/bin/python hsv_calibration_tool.py --camera orbbec
+sudo -E .venv/bin/python tictactoe_prototype8.py --camera orbbec
+```
+
+- Use `.venv/bin/python` (not just `python`): `sudo` doesn't keep your activated environment.
+- `sudo` asks for your Mac password. Run the commands from the project folder.
+- Files the scripts write (e.g. `hsv_ranges.json`) are handed back to your user account, so later non-sudo runs can still update them.
+- Don't pick the "Orbbec Gemini 2 IR Camera" entry from the list: it's greyscale, so color calibration won't work with it.
+
+**On Windows/Linux**, `--camera orbbec` works without administrator rights (through OpenCV's built-in Orbbec support or the SDK).
+
+To see exactly which cameras your computer offers, and whether each one gives a color or greyscale image, run `python camera_select.py`. It also saves a snapshot from each camera.
+
+Close OrbbecViewer before running the scripts. Only one program can use the camera at a time.
+
 ---
 
 ## Step 1 – Calibrate the colors
@@ -63,6 +108,16 @@ python hsv_calibration_tool.py
 ```
 
 1. Put the board under the camera with good, even lighting.
+   **Orbbec Gemini:** if the picture looks too bright (washed-out colors, or areas shown in **red** = over-exposed), fix that first with these keys:
+
+   | Keys | Adjust |
+   |------|--------|
+   | `[` / `]` | exposure down / up (the main fix for a too-bright picture) |
+   | `;` / `'` | gain down / up |
+   | `,` / `.` | brightness down / up |
+   | `e` | auto-exposure on / off |
+
+   Changing exposure or gain turns auto-exposure off, so the picture stays fixed during the exhibit. Settings are saved to `camera_settings.json` and applied automatically by the game. If you change them later, recalibrate the colors.
 2. Press a key to choose which habitat you are sampling:
 
    | Key | Habitat |

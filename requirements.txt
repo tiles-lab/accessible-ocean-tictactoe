@@ -2,3 +2,10 @@ mediapipe==0.10.21
 opencv-contrib-python==4.11.0.86
 numpy==1.26.4
 pygame==2.6.1
+
+# Camera names in the launch list on macOS
+pyobjc-framework-AVFoundation; sys_platform == "darwin"
+
+# Orbbec Gemini 2 color camera: needs the Orbbec SDK. Do NOT add it to this file - install it
+# separately WITHOUT its dependencies (they include opencv-python, which breaks opencv-contrib-python):
+#     python -m pip install --no-deps pyorbbecsdk2
