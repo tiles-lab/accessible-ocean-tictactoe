@@ -4,6 +4,7 @@ import numpy as np
 import mediapipe as mp
 import pygame
 import time
+import json
 import os
 from collections import deque
 
@@ -27,6 +28,16 @@ COLOR_HSV_RANGES = {
     # "Sparse live bottom": (np.array([78, 66, 54]), np.array([103, 207, 255])),
     
 }
+
+# Override the defaults above with the latest calibration, if there is one.
+HSV_RANGES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hsv_ranges.json")
+if os.path.exists(HSV_RANGES_FILE):
+    with open(HSV_RANGES_FILE) as f:
+        for name, (lower, upper) in json.load(f).items():
+            COLOR_HSV_RANGES[name] = (np.array(lower), np.array(upper))
+    print(f"Loaded HSV calibration from {HSV_RANGES_FILE}")
+else:
+    print("No hsv_ranges.json found - using default HSV ranges in the code")
 
 # Display Colors for the Map Screen (BGR format)
 HABITAT_DISPLAY_COLORS = {

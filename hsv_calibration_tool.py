@@ -2,7 +2,7 @@
 HSV calibration tool.
 - Point your camera at a cube face.
 - Click any pixel on it to sample its HSV value.
-- Hold 'r', 'g', 'b', 'y' to set which habitat you're calibrating:
+- Hold 'r', 'd', 'f', 's' to set which habitat you're calibrating:
     r = Rippled sand
     d = Dense live bottom
     f = Flat sand
@@ -14,6 +14,8 @@ HSV calibration tool.
 
 import cv2
 import numpy as np
+import json
+import os
 
 HABITATS = {
     'r': "Rippled sand",
@@ -111,6 +113,20 @@ while True:
             upper   = np.clip(arr.max(axis=0) + padding, 0, 255)
             print(f'    "{name}": (np.array({lower.tolist()}), np.array({upper.tolist()})),')
         print("=============================================\n")
+        ranges = {}
+        for name, pts in samples.items():
+            if len(pts) < 2:
+                continue
+            arr     = np.array(pts)
+            padding = np.array([8, 40, 40])
+            lower   = np.clip(arr.min(axis=0) - padding, 0, 255)
+            upper   = np.clip(arr.max(axis=0) + padding, 0, 255)
+            ranges[name] = [lower.tolist(), upper.tolist()]
+
+        out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hsv_ranges.json")
+        with open(out_path, "w") as f:
+            json.dump(ranges, f, indent=2)
+        print(f"Saved {len(ranges)} habitat ranges to {out_path}")
 
 cap.release()
 cv2.destroyAllWindows()
