@@ -39,7 +39,58 @@ The four habitats are **Flat sand**, **Rippled sand**, **Sparse live bottom** an
 
 ---
 
+## Getting the latest version (for collaborators)
+
+When someone on the team improves the exhibit, they upload ("push") their changes to GitHub. To get those changes on your computer, you download them ("pull"). It takes about a minute, and you can do it any time, for example before testing or setting up the exhibit.
+
+You don't need to know any programming. You'll type a few commands in **Terminal**, an app that comes with every Mac.
+
+### Every time you want the latest version
+
+1. **Open Terminal.** Press `Cmd + Space`, type `Terminal`, and press `Enter`.
+
+2. **Go to the project folder.** Type `cd` followed by a space (don't press `Enter` yet). Then, from Finder, drag the `accessible-ocean-tictactoe` folder into the Terminal window. Its location appears after `cd`. Now press `Enter`.
+
+3. **Download the latest changes.** Type this and press `Enter`:
+   ```bash
+   git pull
+   ```
+   - `Already up to date.` means you already had the newest version. You can stop here.
+   - A list of file names with `+` and `-` signs means it worked: you now have the newest version.
+   - Anything that says `error` or `CONFLICT`: see the next section.
+
+4. **Update the Python packages.** This is safe to run every time, and quick when nothing has changed. Type these two lines, pressing `Enter` after each:
+   ```bash
+   source .venv/bin/activate
+   python -m pip install -r requirements.txt
+   ```
+
+5. **Done.** Start the exhibit as usual (see [Step 2](#step-2--run-the-exhibit)).
+
+**Your calibration is kept.** Your color calibration (`hsv_ranges.json`) and camera picture settings (`camera_settings.json`) belong to your computer only. `git pull` never changes or deletes them, so you don't need to recalibrate after updating, unless the lighting or the camera changed.
+
+### If `git pull` shows an error
+
+Nothing is broken. The exhibit still works with the version you had. Find the message you see:
+
+| Message | What to do |
+|---|---|
+| `Your local changes to the following files would be overwritten` or `Please commit your changes or stash them` | Some files on your computer were edited. Put those edits aside, then pull again: type `git stash`, press `Enter`, then `git pull`, press `Enter`. Your edits aren't deleted: they're saved and can be restored with `git stash pop`. |
+| `not a git repository` | Terminal isn't in the project folder. Redo step 2. |
+| A window asks to install "command line developer tools" | Click **Install**, wait for it to finish, then redo step 3. This happens only once. |
+| `CONFLICT`, `divergent branches`, or anything else | Don't try to fix it. Type `git merge --abort`, press `Enter` (if it says there's nothing to abort, that's fine), then send a screenshot of the Terminal window to the project lead. |
+
+**Tip:** to avoid these errors, don't edit the project's files directly. Settings that change per room (colors, camera picture) are saved in the two files above, which are never touched by updates.
+
+### Prefer clicking to typing?
+
+Install [GitHub Desktop](https://desktop.github.com). Choose **File → Add Local Repository**, and select the `accessible-ocean-tictactoe` folder. After that, click **Fetch origin** and then **Pull origin** to get the latest version. You still need step 4 above after pulling.
+
+---
+
 ## Setup
+
+First time only. On a computer that already has the project, see [Getting the latest version](#getting-the-latest-version-for-collaborators) instead.
 
 ```bash
 git clone https://github.com/tiles-lab/accessible-ocean-tictactoe.git
@@ -179,15 +230,17 @@ At startup, the terminal prints an audio check. Every sound should show `[OK]`. 
 .
 ├── tictactoe_prototype8.py        # Main exhibit
 ├── hsv_calibration_tool.py        # Color calibration tool
+├── camera_select.py               # Camera choice (used by both). Run it alone to list your cameras
 ├── requirements.txt
-├── hsv_ranges.json                # Color calibration (created by the calibration tool)
+├── hsv_ranges.json                # Color calibration (created by the calibration tool, not shared)
+├── camera_settings.json           # Orbbec picture settings (created by the calibration tool, not shared)
 ├── Holes_map_new_colors.png       # Sanctuary map with empty zones
 ├── og_map_new_colors.png          # Fully restored sanctuary map
 ├── Sounds_VF/
 │   ├── BASIC_v3/                  # Habitat sound loops
 │   └── SPEECH_US_v1/              # Alternate habitat sounds
 ├── sounds/                        # Legend descriptions, correct/wrong cues
-└── tic_tac_toe/narration/         # Zone-complete and final narrations
+└── narration/                     # Zone-complete and final narrations
 ```
 
 ---
@@ -212,10 +265,10 @@ All settings are constants at the top of `tictactoe_prototype8.py`:
 ## Troubleshooting
 
 **Wrong camera opens or "could not open camera"**
-The main script tries camera indexes 1, 0 and 2. The calibration tool only uses index 1. If you have a single built-in camera, change `cv2.VideoCapture(1)` to `cv2.VideoCapture(0)` in `hsv_calibration_tool.py`.
+Launch with `--camera orbbec` (or a part of the camera's name), see [Choosing the camera](#choosing-the-camera). Run `python camera_select.py` to see every camera your computer offers, and whether each gives a color or a greyscale image.
 
-**`[MISSING]` sounds at startup**
-Run the script from the repo root, and check that the audio folders were cloned.
+**`[MISSING]` sounds at startup, or no voice when a zone is completed**
+The audio check at startup lists every sound file. Check that each `[MISSING]` file exists at the path shown. `zone_select` is optional and may be missing. If the zone narrations are missing, the startup log also shows a `WARNING` line naming them.
 
 **"Waiting for ArUco markers 45 and 57..."**
 Both markers must be visible, flat and well lit at least once. After that, their positions are remembered even when a hand covers them.

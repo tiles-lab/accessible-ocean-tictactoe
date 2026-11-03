@@ -12,3 +12,8 @@ __pycache__/
 # Editors
 .vscode/
 .idea/
+
+# Per-computer settings (each exhibit computer calibrates its own)
+hsv_ranges.json
+camera_settings.json
+camera_*_snapshot.png
